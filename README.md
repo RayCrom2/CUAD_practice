@@ -47,6 +47,38 @@ versus 1.2 — see [output/](output/) for the full per-contract run logs behind 
   net (it can only convert a miss into a hit, never the reverse) but is a real loosening of what
   "accuracy" means, documented in the run log.
 
+## Phase 2: hallucination-rate testing (in progress)
+
+Phase 1.3 was only ever tested against the 437 contracts confirmed to *have* a Governing
+Law clause. Phase 2 closes that blind spot: does the pipeline invent a clause on the 73
+contracts where CUAD confirms none exists? Versioned the same way as Phase 1 — each
+milestone is its own file and its own dated output log.
+
+| Version | Approach | Absent-set hallucination rate | Present-set accuracy |
+|---|---|---|---|
+| 2.1 | Free-text `NONE` sentinel (iterated from the 1.3 prompt) + a regex bugfix (`venue` matching inside "Avenue") | 14% (10/73) | 100% (50/50) — clean win, no tradeoff |
+| 2.2 | Forced tool use (`report_governing_law(found, clause_text)`) instead of free-text parsing, plus a sharpened prompt distinguishing governing-law from forum/venue/dispute-resolution clauses | **3% (2/73)** | **98% (49/50)** |
+
+2.1's free-text sentinel still let commentary leak through in edge cases (e.g. the model
+writing a full explanation and only appending `NONE` at the very end, which an exact-match
+check didn't catch) — a formatting problem, not a reasoning one. 2.2's tool use eliminates
+that category structurally: `found` is read off a typed field instead of inferred from
+whether a string happens to be empty. The remaining failures were a real, consistent
+pattern: the model confidently mislabeling forum-selection/venue clauses as governing law
+(e.g. "any disputes shall be settled in a court in Florida"). Sharpening that distinction
+fixed 8 of these — but cost one new miss on the present-clause set (BorrowMoney), whose
+CUAD-labeled answer is structurally almost identical to the entity-formation language 1.3
+had already taught the model to reject. A genuine precision/recall tradeoff, not a bug —
+see [output/phase2.1_output_hallucination_rate.md](output/phase2.1_output_hallucination_rate.md)
+and [output/phase2.2_output_hallucination_rate.md](output/phase2.2_output_hallucination_rate.md)
+for both full raw runs.
+
+The 2 remaining absent-set misses in 2.2 aren't model errors: one is a CUAD
+labeling-boundary case (the same legal filing split into a base agreement and two
+amendments, with the clause labeled only on the base agreement), the other is a
+"Guarantee" document with a genuinely variable jurisdiction rather than a fixed named
+state.
+
 ## Repo structure
 
 ```
@@ -56,7 +88,9 @@ phase1.1_governing_law.py        Baseline: full-context extraction + scoring
 phase1.2_governing_law.py        Token-reduction iteration (section snippets)
 phase1.3_governing_law.py        Current: ranked sections, windowing fallback, hardened prompt,
                                   jurisdiction-aware scoring, --indices for targeted re-tests
-phase2.1_governing_law.py        Starting point for Phase 2 (hallucination-rate testing)
+phase2.1_governing_law.py        Phase 2.1: free-text NONE sentinel, hallucination-rate testing
+phase2.2_governing_law.py        Phase 2.2: forced tool use + sharpened governing-law-vs-venue
+                                  prompt -- current hallucination-rate result
 output/                          Raw run logs for each version
 ```
 
@@ -73,7 +107,7 @@ Download `CUAD_v1.json` from the [Atticus Project's GitHub](https://github.com/T
 ## Usage
 
 ```bash
-# Full run with token/cost tracking
+# Phase 1.3: full run with token/cost tracking
 python3 phase1.3_governing_law.py /path/to/CUAD_v1.json --n 50 --show-usage \
     --input-price-per-1m 3.0 --output-price-per-1m 15.0
 
@@ -82,12 +116,16 @@ python3 phase1.3_governing_law.py /path/to/CUAD_v1.json --indices 22 23 39
 
 # Inspect a single contract's raw structure (1-based, same numbering as --indices)
 python3 inspect_contract_structure.py /path/to/CUAD_v1.json 22
+
+# Phase 2.2: hallucination-rate test on all 73 contracts with no Governing Law clause
+python3 phase2.2_governing_law.py /path/to/CUAD_v1.json --absent --n 73 --show-usage \
+    --input-price-per-1m 3.0 --output-price-per-1m 15.0
 ```
 
 ## Roadmap
 
-- **Phase 2** (in progress): formal eval harness — hallucination-rate testing on the 73 contracts
-  with no Governing Law clause, plus precision/recall/F1.
+- **Phase 2** (in progress): formal eval harness. Hallucination-rate testing is done (see above,
+  3% on the full 73-contract absent set); precision/recall/F1 across both populations is next.
 - **Phase 3**: scale to the other starter clause types (Effective Date, Term, Termination for
   Convenience, Cap on Liability) and add retrieval for long contracts.
 - **Phase 4**: failure analysis and iteration across all clause types.
