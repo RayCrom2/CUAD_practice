@@ -54,10 +54,21 @@ Law clause. Phase 2 closes that blind spot: does the pipeline invent a clause on
 contracts where CUAD confirms none exists? Versioned the same way as Phase 1 — each
 milestone is its own file and its own dated output log.
 
-| Version | Approach | Absent-set hallucination rate | Present-set accuracy |
-|---|---|---|---|
-| 2.1 | Free-text `NONE` sentinel (iterated from the 1.3 prompt) + a regex bugfix (`venue` matching inside "Avenue") | 14% (10/73) | 100% (50/50) — clean win, no tradeoff |
-| 2.2 | Forced tool use (`report_governing_law(found, clause_text)`) instead of free-text parsing, plus a sharpened prompt distinguishing governing-law from forum/venue/dispute-resolution clauses | **3% (2/73)** | **98% (49/50)** |
+| Version | Approach | Absent-set hallucination rate | Present-set accuracy | F1 (both populations) |
+|---|---|---|---|---|
+| 2.1 | Free-text `NONE` sentinel (iterated from the 1.3 prompt) + a regex bugfix (`venue` matching inside "Avenue") | 14% (10/73) | 100% (50/50) — clean win, no tradeoff | 90.9% |
+| 2.2 | Forced tool use (`report_governing_law(found, clause_text)`) instead of free-text parsing, plus a sharpened prompt distinguishing governing-law from forum/venue/dispute-resolution clauses | **3% (2/73)** | **98% (49/50)** | **97.0%** |
+
+The F1 column treats both populations as one binary classification + extraction task —
+**precision** (of every contract the model claimed to find a clause in, what fraction were
+right: TP/(TP+FP)) and **recall** (of every contract that actually has a clause, what
+fraction did it find: TP/(TP+FN)), combined via their harmonic mean rather than a simple
+average so an imbalance between the two can't hide behind an artificially decent-looking
+score. It turns "8 false positives fixed, 1 false negative introduced" into one honest
+number: F1 rose from 90.9% to 97.0%, confirming 2.2's tradeoff was a real net improvement,
+not a wash. Computed directly from the saved run logs in
+[`explore.ipynb`](explore.ipynb) — no extra API calls. Full derivation in
+[output/phase2.2_output_hallucination_rate.md](output/phase2.2_output_hallucination_rate.md#precision--recall--f1-across-both-populations).
 
 2.1's free-text sentinel still let commentary leak through in edge cases (e.g. the model
 writing a full explanation and only appending `NONE` at the very end, which an exact-match
@@ -124,8 +135,8 @@ python3 phase2.2_governing_law.py /path/to/CUAD_v1.json --absent --n 73 --show-u
 
 ## Roadmap
 
-- **Phase 2** (in progress): formal eval harness. Hallucination-rate testing is done (see above,
-  3% on the full 73-contract absent set); precision/recall/F1 across both populations is next.
+- **Phase 2** (complete): formal eval harness — hallucination-rate testing (3% on the full
+  73-contract absent set) and precision/recall/F1 across both populations (97.0%, see above).
 - **Phase 3**: scale to the other starter clause types (Effective Date, Term, Termination for
   Convenience, Cap on Liability) and add retrieval for long contracts.
 - **Phase 4**: failure analysis and iteration across all clause types.

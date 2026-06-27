@@ -40,6 +40,49 @@ even though CUAD labels it as governing law. This is a genuine precision/recall 
 a contract that sits right on an ambiguous boundary, not a bug — accepted and documented
 rather than chased further.
 
+## Precision / recall / F1 across both populations
+
+"98% present-clause accuracy" and "97% absent-clause correct-abstention" are two numbers
+on two different denominators — that makes a tradeoff like this one (8 false positives
+fixed, 1 new false negative introduced) something you have to eyeball. Treating both
+populations together as one binary classification + extraction task gives an objective
+answer instead:
+
+|        | TP | FP | FN | TN | Precision | Recall | F1 |
+|---|---|---|---|---|---|---|---|
+| **2.1** | 50 | 10 | 0 | 63 | 83.3% | 100% | 90.9% |
+| **2.2** | 49 | 2 | 1 | 71 | **96.1%** | 98.0% | **97.0%** |
+
+Definitions, using this project's labels:
+- **True positive (TP)**: contract has a Governing Law clause, model found it correctly.
+- **False positive (FP)**: contract has *no* clause, model hallucinated one anyway. This is
+  the hallucination-rate failure mode.
+- **False negative (FN)**: contract has a clause, model missed it or extracted the wrong
+  one (BorrowMoney, in 2.2).
+- **True negative (TN)**: contract has no clause, model correctly returned nothing.
+
+**Precision** = TP / (TP + FP) — of every contract where the model *claimed* to find a
+clause, what fraction of those claims were actually right? 2.1 found 60 "yes" claims (50
+correct + 10 hallucinated), so its precision is 50/60 = 83.3%. 2.2 found only 51 "yes"
+claims (49 correct + 2 hallucinated), so 49/51 = 96.1% — a much more trustworthy "yes."
+
+**Recall** = TP / (TP + FN) — of every contract that *actually has* a clause, what
+fraction did the model successfully extract? 2.1 caught all 50/50 = 100%; 2.2 caught
+49/50 = 98%, the one point conceded to BorrowMoney.
+
+**F1** = 2 × (precision × recall) / (precision + recall) — the harmonic mean of the two,
+not a simple average. The harmonic mean specifically punishes imbalance between precision
+and recall, which is why it's the standard single-number summary here rather than
+`(precision + recall) / 2`: a system with 100% precision and 10% recall would average to a
+deceptively reasonable-looking 55%, but its F1 is 18.2%, correctly reflecting that it's
+barely useful despite being "right" whenever it does respond. By that same logic, F1 going
+from 90.9% to 97.0% is a genuine, not marginal, improvement — recall barely moved (-2
+points) while precision moved substantially (+12.8 points), and F1 reflects that net gain
+honestly rather than letting the two changes simply cancel out in an average.
+
+Computed directly from the saved run logs above — no new API calls — via
+`precision_recall_f1()` in [`explore.ipynb`](../explore.ipynb).
+
 ## What's left in the absent-clause set (not model errors)
 
 The 2 remaining absent-clause misses are not extraction failures:
