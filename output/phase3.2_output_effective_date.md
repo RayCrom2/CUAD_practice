@@ -1,0 +1,425 @@
+# Phase 3.2 — Effective Date extraction, n=50 (2026-07-01)
+
+**Result: ACCURACY 37/50 = 74%** | input tokens 392,909 | estimated cost $1.2576
+
+Up from 64% (32/50) in phase 3.1 — a 10-point gain from two targeted changes to the
+section-selection logic. Of the 13 remaining misses, 5 are confirmed scorer-vs-substance
+gaps where the model found a substantively correct answer, raising the true extraction
+accuracy to **42/50 = 84%**.
+
+> **Note:** After this run was documented, the internal section-selection logic was
+> refactored into a single pass (`_scan_sections_and_keywords()` replacing
+> `build_section_spans()` + the separate keyword scan). This refactor also incidentally
+> fixed a windowing-trigger edge case, improving offline coverage from 5/50 → 4/50 gaps.
+> That version is **phase 3.3** — see
+> [output/phase3.3_output_effective_date.md](phase3.3_output_effective_date.md).
+
+## What changed from 3.1
+
+### Change 1 — `_line_tier()` fast-path when "effective date" is explicit (Category B fix)
+
+In `_line_tier()`, tier-1 previously required TWO conditions simultaneously: a strong
+keyword match AND `_matches_agreement()` (meaning "this Agreement" or `(the "Agreement")`
+appears on the same line). This correctly filtered out false positives like delivery dates
+or renewal clauses. But it also filtered out the **title/caption preamble convention** —
+lines like `"SUPPORT AND MAINTENANCE AGREEMENT dated as of April __, 2005 (the "Effective
+Date")"` where the document title is used instead of "this", so `_matches_agreement()`
+failed.
+
+Fix: when the phrase "effective date" itself appears on a matching line, skip the
+`_matches_agreement()` guard and return tier-1 immediately. Unlike generic patterns such as
+"dated as of" or "shall commence", the literal phrase "effective date" almost exclusively
+labels the agreement's own start — it doesn't appear in unrelated delivery dates or
+renewal clauses in the same way.
+
+**Contracts recovered:** #16 (ON2Technologies, preamble), #20 (ChinaRealEstate,
+definitions section `"Effective Date" means...`), #33 (NICE Ltd., preamble).
+
+### Change 2 — bare `"commencing"` in STRONG patterns (Category A partial fix)
+
+The existing pattern `r"commencing on"` required the word "on" after "commencing".
+Contract #4 (AdamsGolf) uses `"commencing the 1st day of September 2004"` — "commencing
+the", not "commencing on" — so the section was never even flagged as a candidate.
+Broadened to bare `r"commencing"`, which catches all forms.
+
+**Contract recovered:** #4 (AdamsGolf, commencement date with ordinal-day phrasing).
+
+### Attempted change that was reverted — ordinal-day pattern
+
+During development, `r"\d+(?:st|nd|rd|th)\s+day\s+of"` was added to catch ordinal-day
+date forms. It correctly made #4's section a candidate, but also matched execution-date
+sentences in the opening preamble (`"entered into this 7th day of September, 1999"`,
+`"entered into this 6th day of April, 1999"`), which contain both an ordinal day AND
+"this Agreement" co-occurrence — giving them tier-1 and displacing the correct commencement
+clauses for #1 (LimeEnergy) and #3 (CentrackInternational). Removed after confirming that
+bare `"commencing"` alone was sufficient for #4.
+
+**Lesson:** ordinal-day expressions are very common in execution-date opening sentences and
+can't be used as a strong tier-1 signal without an additional disambiguation condition.
+
+## Remaining misses — categorized
+
+**Scorer-vs-substance gaps (5) — model substantively correct, different span from CUAD's label:**
+- #7: Gold is a definitions cross-reference; model found the actual preamble declaration.
+- #10: Gold is `"day and year first above written"` cross-ref; model found the caption date.
+- #11: Gold is a counterparts/execution-mechanics clause; model found `"dated as of
+  September 30, 2019"`.
+- #24: Gold is `"date when representatives sign hereon"`; model found `"January 24, 2014"`.
+- #44: Gold is `"Commencement Date means the date of this Agreement"`; model found `"19 DAY
+  OF MAY, 2010"` (the referenced date).
+
+**Structural/unfixable (5):**
+- #38: Event-conditional clause (`"begin upon acceptance of Affiliate's Program
+  application"`) — no calendar date at all. Even with correct section selection the model
+  would need to extract a non-date condition.
+- #40: Blank template (`"this ______ day of ________________, 2013"`). No date to extract.
+- #43: "Appointment" terminology and false-positive tier-1 from `"COLLECTIVE AGREEMENTS"`.
+- #47 / #48: Category C — correct tier-2 header selected but date value lives in a
+  completely different section (CUAD's annotator labeled a date outside the
+  "Effective Date" section).
+
+**Genuine extraction failures (3):**
+- #6: Event-conditional (no fixed date), model finds a different, real date.
+- #25: Term commencement `"February 1, 1998"` vs. execution date `"January 26, 1998"` —
+  same execution-vs-effective confusion that BorrowMoney exhibits.
+- #26: Bare date `"December 17, 2018"` exists, model returns a procedural clause
+  describing the mechanism of effectiveness instead.
+
+**BorrowMoney (#18) recovered this run** (after being a miss in 3.1 final). As documented
+in 3.1, BorrowMoney is a known volatile contract that flips between runs due to three
+competing date references and no unambiguous effective date sentence. Its recovery here
+reflects LLM non-determinism, not a pipeline fix.
+
+## Raw run output, n=50
+
+```
+$ python3 phase3.2_effective_date.py "/Users/raymondcromwell/Downloads/data/CUADv1.json" --n 50 --show-usage --input-price-per-1m 3.0 --output-price-per-1m 15.0
+
+Testing 50 contracts that have an Effective Date clause.
+
+[ 1/50] (contract #1) OK  LIMEENERGYCO_09_09_1999-EX-10-DISTRIBUTOR AGR...
+        gold  : 'The term of this  Agreement  shall be ten (10)                            years '
+        pred  : 'The term of this  Agreement  shall be ten (10)                            years '
+        src   : section-match
+        ctx   : 54290 chars -> 15622 chars sent
+        usage : in=4553 out=106 total=4659
+[ 2/50] (contract #2) OK  WHITESMOKE,INC_11_08_2011-EX-10.26-PROMOTION ...
+        gold  : '1 August 2011'
+        pred  : 'This Promotion and Distribution Agreement including all exhibits (collectively r'
+        src   : section-match
+        ctx   : 70383 chars -> 57559 chars sent
+        usage : in=14648 out=172 total=14820
+[ 3/50] (contract #3) OK  CENTRACKINTERNATIONALINC_10_29_1999-EX-10.3-W...
+        gold  : 'The term of this Agreement for the Hosted Site shall commence upon April 1, 1999'
+        pred  : 'The term of this Agreement for the Hosted Site shall commence upon April 1, 1999'
+        src   : section-match
+        ctx   : 15176 chars -> 905 chars sent
+        usage : in=1425 out=71 total=1496
+[ 4/50] (contract #4) OK  ADAMSGOLFINC_03_21_2005-EX-10.17-ENDORSEMENT ...
+        gold  : 'The Term of this Agreement shall be for a period of [* ****] years and [*****] m'
+        pred  : 'The Term of this Agreement shall be for a period of [* ****] years and [*****] m'
+        src   : section-match
+        ctx   : 24632 chars -> 193 chars sent
+        usage : in=1285 out=86 total=1371
+[ 5/50] (contract #5) OK  KIROMICBIOPHARMA,INC_05_11_2020-EX-10.23-CONS...
+        gold  : 'This letter agreement will be effective as of July 1, 2018.'
+        pred  : 'This letter agreement will be effective as of July 1, 2018.'
+        src   : section-match
+        ctx   : 18403 chars -> 17065 chars sent
+        usage : in=4775 out=66 total=4841
+[ 6/50] (contract #6) MISS VEONEER,INC_02_21_2020-EX-10.11-JOINT VENTURE...
+        gold  : 'This Amendment shall only become effective upon the VNBJ Closing...'
+        pred  : 'This AMENDMENT AND TERMINATION OF JOINT VENTURE AGREEMENT (this "Amendment") is made and entered into effective as of October 30, 2019 (the "Effective Date")'
+        pred matched patterns: ['effective date', 'effective as of', 'made and entered into', ...]
+        src   : section-match
+        ctx   : 8257 chars -> 8211 chars sent
+        usage : in=3574 out=93 total=3667
+[ 7/50] (contract #7) MISS DovaPharmaceuticalsInc_20181108_10-Q_EX-10.2_...
+        gold  : '"Effective Date" shall have the meaning set forth in the preamble to this Agreement.'
+        pred  : 'This Co-Promotion Agreement (this "Agreement") is entered into and dated as of September 26, 2018 (the "Effective Date")'
+        pred matched patterns: ['effective date', 'dated as of', ...]
+        src   : section-match
+        ctx   : 175580 chars -> 130876 chars sent
+        usage : in=31219 out=84 total=31303
+[ 8/50] (contract #8) OK  PACIRA PHARMACEUTICALS, INC. - A_R STRATEGIC ...
+        gold  : 'August 10, 2007'
+        pred  : 'THIS AMENDED AND RESTATED STRATEGIC LICENSING, DISTRIBUTION AND MARKETING AGREEM'
+        src   : section-match
+        ctx   : 145168 chars -> 127590 chars sent
+        usage : in=31254 out=240 total=31494
+[ 9/50] (contract #9) OK  FTENETWORKS,INC_02_18_2016-EX-99.4-STRATEGIC ...
+        gold  : '17t h day of February 2016'
+        pred  : 'THIS STRATEGIC ALLIANCE AGREEMENT (the "Agreement"), made effective this 17t h d'
+        src   : section-match
+        ctx   : 37829 chars -> 4691 chars sent
+        usage : in=2329 out=92 total=2421
+[10/50] (contract #10) MISS DOMINIADVISORTRUST_02_18_2005-EX-99.(H)(2)-SP...
+        gold  : 'This Agreement shall become effective as of the day and year first above written...'
+        pred  : 'SPONSORSHIP AGREEMENT, dated as of February 4, 2005...'
+        pred matched patterns: ['dated as of', ...]
+        src   : section-match
+        ctx   : 12555 chars -> 11832 chars sent
+        usage : in=3647 out=106 total=3753
+[11/50] (contract #11) MISS CerenceInc_20191002_8-K_EX-10.4_11827494_EX-1...
+        gold  : 'This Agreement may be executed in one or more counterparts...shall become effective when one or more counterparts have been signed...'
+        pred  : 'INTELLECTUAL PROPERTY AGREEMENT, dated as of September 30, 2019 (this "Agreement")...'
+        pred matched patterns: ['dated as of', ...]
+        src   : section-match
+        ctx   : 62170 chars -> 24647 chars sent
+        usage : in=7079 out=110 total=7189
+[12/50] (contract #12) OK  ThriventVariableInsuranceAccountB_20190701_N-...
+        gold  : 'July 1, 2019'
+        pred  : 'Effective Date: July 1, 2019'
+        src   : section-match
+        ctx   : 4871 chars -> 2877 chars sent
+        usage : in=1892 out=62 total=1954
+[13/50] (contract #13) OK  ReynoldsConsumerProductsInc_20191115_S-1_EX-1...
+        gold  : 'November 1, 2019'
+        pred  : 'MASTER SUPPLY AGREEMENT (the "Agreement") dated November 1, 2019 (the "Effective'
+        src   : section-match
+        ctx   : 61710 chars -> 61215 chars sent
+        usage : in=14153 out=152 total=14305
+[14/50] (contract #14) OK  PREMIERBIOMEDICALINC_05_14_2020-EX-10.2-INTEL...
+        gold  : 'May 12, 2020'
+        pred  : 'This Intellectual Property Agreement (this "Agreement") is entered into on May 1'
+        src   : section-match
+        ctx   : 23282 chars -> 8017 chars sent
+        usage : in=3222 out=78 total=3300
+[15/50] (contract #15) OK  INTRICONCORP_03_10_2009-EX-10.22-Strategic Al...
+        gold  : '1st day of October, 2008'
+        pred  : 'This Agreement is entered into and is effective as of the 1st day of October, 20'
+        src   : section-match
+        ctx   : 52967 chars -> 47315 chars sent
+        usage : in=12119 out=79 total=12198
+[16/50] (contract #16) OK  ON2TECHNOLOGIES,INC_11_17_2006-EX-10.3-SUPPOR...
+        gold  : 'April __, 2005'
+        pred  : 'SUPPORT AND MAINTENANCE AGREEMENT dated as of April __, 2005 (the "Effective Dat'
+        src   : section-match
+        ctx   : 61392 chars -> 50980 chars sent
+        usage : in=12903 out=105 total=13008
+[17/50] (contract #17) OK  OPERALTD_04_30_2020-EX-4.14-SERVICE AGREEMENT
+        gold  : 'April. 1st 2019'
+        pred  : 'This Service Agreement ("Agreement") is entered into on April. 1st 2019 ("Effect'
+        src   : section-match
+        ctx   : 20983 chars -> 6328 chars sent
+        usage : in=2750 out=75 total=2825
+[18/50] (contract #18) OK  BORROWMONEYCOM,INC_06_11_2020-EX-10.1-JOINT V...
+        gold  : 'The duration of this Venture (the "Term") will begin on March 1, 2020 and contin'
+        pred  : 'The duration of this Venture (the "Term") will begin on March 1, 2020'
+        src   : section-match
+        ctx   : 21450 chars -> 1962 chars sent
+        usage : in=1740 out=72 total=1812
+[19/50] (contract #19) OK  ZEBRATECHNOLOGIESCORP_04_16_2014-EX-10.1-INTE...
+        gold  : 'April 14, 2014'
+        pred  : 'THIS INTELLECTUAL PROPERTY AGREEMENT (this "IP Agreement") is entered into as of'
+        src   : section-match
+        ctx   : 127205 chars -> 87508 chars sent
+        usage : in=21262 out=120 total=21382
+[20/50] (contract #20) OK  ChinaRealEstateInformationCorp_20090929_F-1_E...
+        gold  : '"Effective Date" means the Closing Date as set forth in the Share Purchase Agree'
+        pred  : '"Effective Date" means the Closing Date as set forth in the Share Purchase Agree'
+        src   : section-match
+        ctx   : 49191 chars -> 40434 chars sent
+        usage : in=10735 out=69 total=10804
+[21/50] (contract #21) OK  HERTZGLOBALHOLDINGS,INC_07_07_2016-EX-10.4-IN...
+        gold  : '30  day of June 2016'
+        pred  : 'This INTELLECTUAL PROPERTY AGREEMENT (this "Agreement" or "IPA"), effective as o'
+        src   : section-match
+        ctx   : 30968 chars -> 30554 chars sent
+        usage : in=8769 out=89 total=8858
+[22/50] (contract #22) OK  GLOBALTECHNOLOGIESLTD_06_08_2020-EX-10.16-CON...
+        gold  : '2nd day of January 2020'
+        pred  : 'This Consulting Agreement (the "Agreement") is made and entered into as of this '
+        src   : section-match
+        ctx   : 20805 chars -> 4705 chars sent
+        usage : in=2330 out=77 total=2407
+[23/50] (contract #23) OK  CORIOINC_07_20_2000-EX-10.5-LICENSE AND HOSTI...
+        gold  : 'October 29, 1999'
+        pred  : 'This License and Hosting Agreement (the "AGREEMENT") is made and entered into as'
+        src   : section-match
+        ctx   : 62324 chars -> 55843 chars sent
+        usage : in=12792 out=83 total=12875
+[24/50] (contract #24) MISS TUNIUCORP_03_06_2014-EX-10-COOPERATION AGREEM...
+        gold  : 'This Agreement shall take effect as of the date when the authorized representatives of the Parties sign hereon.'
+        pred  : 'This Cooperation Agreement (2014 Amendment) (this "Agreement") is entered into on January 24, 2014 in Beijing...'
+        pred matched patterns: ['\b(?:January|...|December)\s+\d{1,2},?\s+\d{4}\b']
+        src   : section-match
+        ctx   : 17917 chars -> 17903 chars sent
+        usage : in=5056 out=83 total=5139
+[25/50] (contract #25) MISS CYBERIANOUTPOSTINC_07_09_1998-EX-10.13-PROMOT...
+        gold  : 'The term of this Agreement (the "Term") will begin on February 1, 1998...'
+        pred  : 'This Promotion Agreement (the "Agreement") is dated as of January 26, 1998...'
+        pred matched patterns: ['dated as of', ...]
+        src   : section-match
+        ctx   : 25288 chars -> 23373 chars sent
+        usage : in=6182 out=99 total=6281
+[26/50] (contract #26) MISS SENMIAOTECHNOLOGYLTD_02_19_2019-EX-10.5-Colla...
+        gold  : 'December 17, 2018'
+        pred  : 'The Agreement executed offline in paper form shall become effective upon the completion of the execution by both Parties...'
+        pred matched patterns: ['effective date', 'become effective']
+        src   : section-match
+        ctx   : 73890 chars -> 6666 chars sent
+        usage : in=2812 out=135 total=2947
+[27/50] (contract #27) OK  HealthcareIntegratedTechnologiesInc_20190812_...
+        gold  : '31 day of July 2019'
+        pred  : 'This Walabot-HOME Reseller Agreement ("Agreement") is made and entered into as o'
+        src   : section-match
+        ctx   : 22288 chars -> 7557 chars sent
+        usage : in=3274 out=88 total=3362
+[28/50] (contract #28) OK  LOYALTYPOINTINC_11_16_2004-EX-10.2-RESELLER A...
+        gold  : 'This Agreement is effective as of August 1, 2004, (the "Effective Date") and sha'
+        pred  : 'This Agreement is effective as of August 1, 2004, (the "Effective Date")'
+        src   : section-match
+        ctx   : 117478 chars -> 28803 chars sent
+        usage : in=6967 out=72 total=7039
+[29/50] (contract #29) OK  BNCMORTGAGEINC_05_17_1999-EX-10.4-LICENSING A...
+        gold  : 'February 26, 1999'
+        pred  : 'This Agreement is entered into on February 26, 1999, (the "Effective Date")'
+        src   : section-match
+        ctx   : 32680 chars -> 32581 chars sent
+        usage : in=8092 out=72 total=8164
+[30/50] (contract #30) OK  ENERGOUSCORP_03_16_2017-EX-10.24-STRATEGIC AL...
+        gold  : 'November 6, 2016'
+        pred  : 'THIS STRATEGIC ALLIANCE AGREEMENT ("Agreement") is made and entered into as of N'
+        src   : section-match
+        ctx   : 81926 chars -> 16745 chars sent
+        usage : in=5311 out=176 total=5487
+[31/50] (contract #31) OK  CytodynInc_20200109_10-Q_EX-10.5_11941634_EX-...
+        gold  : 'December 17, 2019'
+        pred  : 'This Commercialization and License Agreement (this "Agreement") is made effectiv'
+        src   : section-match
+        ctx   : 159488 chars -> 116949 chars sent
+        usage : in=28473 out=122 total=28595
+[32/50] (contract #32) OK  MSCIINC_02_28_2008-EX-10.10-
+        gold  : 'November 20, 2007'
+        pred  : 'This Intellectual Property Agreement (the "Agreement"), is entered into as of No'
+        src   : section-match
+        ctx   : 11770 chars -> 2674 chars sent
+        usage : in=1837 out=112 total=1949
+[33/50] (contract #33) OK  NICELTD_06_26_2003-EX-4.5-OUTSOURCING AGREEME...
+        gold  : 'January 21st, 2002'
+        pred  : 'This Manufacturing Outsourcing Agreement (The "AGREEMENT") is entered into on Ja'
+        src   : section-match
+        ctx   : 148163 chars -> 87292 chars sent
+        usage : in=18302 out=206 total=18508
+[34/50] (contract #34) OK  ImpresseCorp_20000322_S-1A_EX-10.11_5199234_E...
+        gold  : 'March 3, 2000'
+        pred  : 'This Co-Branding Agreement (this "Agreement") dated March 3, 2000 (the "Effectiv'
+        src   : section-match
+        ctx   : 47639 chars -> 12587 chars sent
+        usage : in=4256 out=169 total=4425
+[35/50] (contract #35) OK  AlliedEsportsEntertainmentInc_20190815_8-K_EX...
+        gold  : 'February 1, 2018'
+        pred  : 'This JOINT CONTENT LICENSE AGREEMENT (the "Agreement"), dated February 1, 2018 ('
+        src   : section-match
+        ctx   : 35504 chars -> 14781 chars sent
+        usage : in=5062 out=251 total=5313
+[36/50] (contract #36) OK  CreditcardscomInc_20070810_S-1_EX-10.33_36229...
+        gold  : 'The term of this Agreement will commence on the date that the Affiliate Registra'
+        pred  : 'The term of this Agreement will commence on the date that the Affiliate Registra'
+        src   : section-match
+        ctx   : 28804 chars -> 19313 chars sent
+        usage : in=5646 out=71 total=5717
+[37/50] (contract #37) OK  Zounds Hearing, Inc. - MANUFACTURING DESIGN M...
+        gold  : 'October 3, 2018'
+        pred  : 'dated effective October 3, 2018 (the "Effective Date")'
+        src   : section-match
+        ctx   : 47001 chars -> 4613 chars sent
+        usage : in=2222 out=68 total=2290
+[38/50] (contract #38) MISS SouthernStarEnergyInc_20051202_SB-2A_EX-9_801...
+        gold  : "The term of this Agreement will begin upon acceptance of Affiliate's Program application..."
+        pred  : ''
+        pred matched patterns: NONE
+        src   : section-match
+        ctx   : 22721 chars -> 9591 chars sent
+        usage : in=3463 out=50 total=3513
+[39/50] (contract #39) OK  ConformisInc_20191101_10-Q_EX-10.6_11861402_E...
+        gold  : 'September 30, 2019'
+        pred  : 'This Development Agreement ("this Agreement") is entered into and effective as o'
+        src   : section-match
+        ctx   : 63217 chars -> 43448 chars sent
+        usage : in=12139 out=79 total=12218
+[40/50] (contract #40) MISS Principal Life Insurance Company - Broker Dea...
+        gold  : 'this ______ day of ________________, 2013'
+        pred  : ''
+        pred matched patterns: NONE
+        src   : section-match
+        ctx   : 29599 chars -> 2846 chars sent
+        usage : in=1866 out=50 total=1916
+[41/50] (contract #41) OK  LegacyEducationAllianceInc_20200330_10-K_EX-1...
+        gold  : '12-23-2019'
+        pred  : 'This Real Estate Education Training Program Development Agreement (this "Agreeme'
+        src   : section-match
+        ctx   : 46255 chars -> 25348 chars sent
+        usage : in=7715 out=136 total=7851
+[42/50] (contract #42) OK  VERICELCORP_08_06_2019-EX-10.10-SUPPLY AGREEM...
+        gold  : 'May 6, 2019'
+        pred  : 'THIS SUPPLY AGREEMENT (the "Agreement") is entered into as of May 6, 2019 (the "'
+        src   : section-match
+        ctx   : 102006 chars -> 23770 chars sent
+        usage : in=6860 out=178 total=7038
+[43/50] (contract #43) MISS WPPPLC_04_30_2020-EX-4.28-SERVICE AGREEMENT
+        gold  : '27 January 2020'
+        pred  : ''
+        pred matched patterns: NONE
+        src   : section-match
+        ctx   : 65547 chars -> 20832 chars sent
+        usage : in=5921 out=50 total=5971
+[44/50] (contract #44) MISS WASTE2ENERGYHOLDINGS,INC_06_03_2010-EX-10.2-S...
+        gold  : 'Commencement Date means the date of this Agreement'
+        pred  : 'THIS AGREEMENT IS MADE ON THE 19  DAY OF MAY , 2010'
+        pred matched patterns: NONE
+        src   : section-match
+        ctx   : 40442 chars -> 40356 chars sent
+        usage : in=10429 out=71 total=10500
+[45/50] (contract #45) OK  WORLDWIDESTRATEGIESINC_11_02_2005-EX-10-RESEL...
+        gold  : '14 day of SEPTEMBER, 200_'
+        pred  : 'This Reseller Agreement is made and entered into as of this 14 day of SEPTEMBER,'
+        src   : section-match
+        ctx   : 84618 chars -> 84361 chars sent
+        usage : in=18538 out=173 total=18711
+[46/50] (contract #46) OK  FEDERATEDGOVERNMENTINCOMESECURITIESINC_04_28_...
+        gold  : 'March 1, 2016'
+        pred  : 'This SECOND AMENDMENT TO SERVICES AGREEMENT, dated and effective as of March 1, '
+        src   : section-match
+        ctx   : 5466 chars -> 3065 chars sent
+        usage : in=1869 out=124 total=1993
+[47/50] (contract #47) MISS AzulSa_20170303_F-1A_EX-10.3_9943903_EX-10.3_...
+        gold  : 'January 6th, 2016'
+        pred  : 'This Amendment shall enter into force on the date of its signature by both Parties'
+        pred matched patterns: NONE
+        src   : section-match
+        ctx   : 16870 chars -> 320 chars sent
+        usage : in=1312 out=67 total=1379
+[48/50] (contract #48) MISS DRAGONSYSTEMSINC_01_08_1999-EX-10.17-OUTSOURC...
+        gold  : '19 Jan. 1998'
+        pred  : 'EFFECTIVE AS OF (EFFECTIVE DATE)'
+        pred matched patterns: ['effective date', 'effective as of']
+        src   : section-match
+        ctx   : 8599 chars -> 684 chars sent
+        usage : in=1375 out=59 total=1434
+[49/50] (contract #49) OK  SEPARATEACCOUNTIIOFAGL_05_02_2011-EX-99.(J)(4...
+        gold  : 'March 30, 2011'
+        pred  : 'This Unconditional Capital Maintenance Agreement (this "Agreement"), is made, en'
+        src   : section-match
+        ctx   : 20121 chars -> 19761 chars sent
+        usage : in=5355 out=129 total=5484
+[50/50] (contract #50) OK  GridironBionutrientsInc_20171206_8-K_EX-10.2_...
+        gold  : 'November 7, 2017'
+        pred  : 'This Endorsement Agreement Addendum I (the "Addendum") is made and effective Nov'
+        src   : section-match
+        ctx   : 3456 chars -> 3204 chars sent
+        usage : in=2120 out=79 total=2199
+
+==================================================
+ACCURACY: 37/50 = 74%
+SECTION MATCHES: 50/50
+FALLBACKS: 0/50
+TOKENS: input=392909 output=5256 total=398165
+AVG INPUT TOKENS / CONTRACT: 7858.2
+AVG INPUT TOKENS / SECTION MATCH: 7858.2
+AVG INPUT TOKENS / FALLBACK: 0.0
+CONTEXT CHARS: full=2520344 snippets=1466352
+ESTIMATED COST: $1.2576
+==================================================
+```
