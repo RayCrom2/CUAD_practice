@@ -119,6 +119,8 @@ Download `CUAD_v1.json` from the [Atticus Project's GitHub](https://github.com/T
 
 ```bash
 # Phase 1.3: full run with token/cost tracking
+# Prices will vary on model; these prices are based on claude-sonnet-4-5
+# Parameter following '--n' is the number of contracts to test (default 20 if not specified)
 python3 phase1.3_governing_law.py /path/to/CUAD_v1.json --n 50 --show-usage \
     --input-price-per-1m 3.0 --output-price-per-1m 15.0
 
