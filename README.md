@@ -68,7 +68,7 @@ score. It turns "8 false positives fixed, 1 false negative introduced" into one 
 number: F1 rose from 90.9% to 97.0%, confirming 2.2's tradeoff was a real net improvement,
 not a wash. Computed directly from the saved run logs in
 [`explore.ipynb`](explore.ipynb) — no extra API calls. Full derivation in
-[output/phase2.2_output_hallucination_rate.md](output/phase2.2_output_hallucination_rate.md#precision--recall--f1-across-both-populations).
+[output/2.2_output_GL_73.md](output/2.2_output_GL_73.md#precision--recall--f1-across-both-populations).
 
 2.1's free-text sentinel still let commentary leak through in edge cases (e.g. the model
 writing a full explanation and only appending `NONE` at the very end, which an exact-match
@@ -80,8 +80,8 @@ pattern: the model confidently mislabeling forum-selection/venue clauses as gove
 fixed 8 of these — but cost one new miss on the present-clause set (BorrowMoney), whose
 CUAD-labeled answer is structurally almost identical to the entity-formation language 1.3
 had already taught the model to reject. A genuine precision/recall tradeoff, not a bug —
-see [output/phase2.1_output_hallucination_rate.md](output/phase2.1_output_hallucination_rate.md)
-and [output/phase2.2_output_hallucination_rate.md](output/phase2.2_output_hallucination_rate.md)
+see [output/2.1_output_GL_73.md](output/2.1_output_GL_73.md)
+and [output/2.2_output_GL_73.md](output/2.2_output_GL_73.md)
 for both full raw runs.
 
 The 2 remaining absent-set misses in 2.2 aren't model errors: one is a CUAD
@@ -93,7 +93,7 @@ state.
 ## Repo structure
 
 ```
-inspect_cuad.py                  Load & inspect the raw CUAD_v1.json structure
+inspect_cuad.py                  Load & inspect the raw CUADv1.json structure
 inspect_contract_structure.py    Print one contract with clause/section markers for manual review
 phase1.1_governing_law.py        Baseline: full-context extraction + scoring
 phase1.2_governing_law.py        Token-reduction iteration (section snippets)
@@ -112,8 +112,8 @@ python3 -m pip install -r requirements.txt
 export ANTHROPIC_API_KEY="sk-ant-..."   # or put it in a .env file (gitignored)
 ```
 
-Download `CUAD_v1.json` from the [Atticus Project's GitHub](https://github.com/TheAtticusProject/cuad)
-(`data/CUAD_v1.json`) — it's not bundled in this repo.
+Download `CUADv1.json` from the [Atticus Project's GitHub](https://github.com/TheAtticusProject/cuad)
+(`data/CUADv1.json`) — it's not bundled in this repo.
 
 ## Usage
 
@@ -121,17 +121,17 @@ Download `CUAD_v1.json` from the [Atticus Project's GitHub](https://github.com/T
 # Phase 1.3: full run with token/cost tracking
 # Prices will vary on model; these prices are based on claude-sonnet-4-5
 # Parameter following '--n' is the number of contracts to test (default 20 if not specified)
-python3 phase1.3_governing_law.py /path/to/CUAD_v1.json --n 50 --show-usage \
+python3 phase1.3_governing_law.py /path/to/CUADv1.json --n 50 --show-usage \
     --input-price-per-1m 3.0 --output-price-per-1m 15.0
 
 # Re-test specific contracts only (cheap — useful for debugging a known miss)
-python3 phase1.3_governing_law.py /path/to/CUAD_v1.json --indices 22 23 39
+python3 phase1.3_governing_law.py /path/to/CUADv1.json --indices 22 23 39
 
 # Inspect a single contract's raw structure (1-based, same numbering as --indices)
-python3 inspect_contract_structure.py /path/to/CUAD_v1.json 22
+python3 inspect_contract_structure.py /path/to/CUADv1.json 22
 
 # Phase 2.2: hallucination-rate test on all 73 contracts with no Governing Law clause
-python3 phase2.2_governing_law.py /path/to/CUAD_v1.json --absent --n 73 --show-usage \
+python3 phase2.2_governing_law.py /path/to/CUADv1.json --absent --n 73 --show-usage \
     --input-price-per-1m 3.0 --output-price-per-1m 15.0
 ```
 
