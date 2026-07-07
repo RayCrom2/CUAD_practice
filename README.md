@@ -93,16 +93,20 @@ state.
 ## Repo structure
 
 ```
-inspect_cuad.py                  Load & inspect the raw CUADv1.json structure
-inspect_contract_structure.py    Print one contract with clause/section markers for manual review
-phase1.1_governing_law.py        Baseline: full-context extraction + scoring
-phase1.2_governing_law.py        Token-reduction iteration (section snippets)
-phase1.3_governing_law.py        Current: ranked sections, windowing fallback, hardened prompt,
-                                  jurisdiction-aware scoring, --indices for targeted re-tests
-phase2.1_governing_law.py        Phase 2.1: free-text NONE sentinel, hallucination-rate testing
-phase2.2_governing_law.py        Phase 2.2: forced tool use + sharpened governing-law-vs-venue
-                                  prompt -- current hallucination-rate result
-output/                          Raw run logs for each version
+inspect_cuad.py                    Load & inspect the raw CUADv1.json structure
+inspect_contract_structure.py      Print one contract with clause/section markers for manual review
+versions/                          One script per phase iteration
+  phase1.1_governing_law.py        Baseline: full-context extraction + scoring
+  phase1.2_governing_law.py        Token-reduction iteration (section snippets)
+  phase1.3_governing_law.py        Ranked sections, windowing fallback, hardened prompt,
+                                    jurisdiction-aware scoring, --indices for targeted re-tests
+  phase2.1_governing_law.py        Phase 2.1: free-text NONE sentinel, hallucination-rate testing
+  phase2.2_governing_law.py        Phase 2.2: forced tool use + sharpened governing-law-vs-venue
+                                    prompt -- current hallucination-rate result
+  phase3.1-3.6_effective_date.py   Effective Date series: same infrastructure, second clause type.
+                                    3.4 TOC downgrade, 3.5 weak-pool ordering + --diagnose,
+                                    3.6 effectiveness-clause-vs-preamble prompt (current, 84%)
+output/                            Raw run logs for each version
 ```
 
 ## Setup
@@ -121,17 +125,17 @@ Download `CUADv1.json` from the [Atticus Project's GitHub](https://github.com/Th
 # Phase 1.3: full run with token/cost tracking
 # Prices will vary on model; these prices are based on claude-sonnet-4-5
 # Parameter following '--n' is the number of contracts to test (default 20 if not specified)
-python3 phase1.3_governing_law.py /path/to/CUADv1.json --n 50 --show-usage \
+python3 versions/phase1.3_governing_law.py /path/to/CUADv1.json --n 50 --show-usage \
     --input-price-per-1m 3.0 --output-price-per-1m 15.0
 
 # Re-test specific contracts only (cheap — useful for debugging a known miss)
-python3 phase1.3_governing_law.py /path/to/CUADv1.json --indices 22 23 39
+python3 versions/phase1.3_governing_law.py /path/to/CUADv1.json --indices 22 23 39
 
 # Inspect a single contract's raw structure (1-based, same numbering as --indices)
 python3 inspect_contract_structure.py /path/to/CUADv1.json 22
 
 # Phase 2.2: hallucination-rate test on all 73 contracts with no Governing Law clause
-python3 phase2.2_governing_law.py /path/to/CUADv1.json --absent --n 73 --show-usage \
+python3 versions/phase2.2_governing_law.py /path/to/CUADv1.json --absent --n 73 --show-usage \
     --input-price-per-1m 3.0 --output-price-per-1m 15.0
 ```
 

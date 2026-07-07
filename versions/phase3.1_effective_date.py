@@ -1,5 +1,5 @@
 """
-Phase 3.2 thin slice: extract the Effective Date from CUAD contracts using
+Phase 3.1 thin slice: extract the Effective Date from CUAD contracts using
 Claude, then score against the gold labels.
 
 This is the second clause type after Governing Law (Phase 1-2). Reuses the
@@ -15,8 +15,8 @@ Setup:
     export ANTHROPIC_API_KEY="sk-ant-..."
 
 Run:
-    python3 phase3.2_effective_date.py "/path/to/CUADv1.json" --n 30
-    python3 phase3.2_effective_date.py "/path/to/CUADv1.json" --absent --n 20
+    python3 versions/phase3.1_effective_date.py "/path/to/CUADv1.json" --n 30
+    python3 versions/phase3.1_effective_date.py "/path/to/CUADv1.json" --absent --n 20
 """
 
 import sys
@@ -46,7 +46,7 @@ STRONG_EFFECTIVE_DATE_PATTERNS = [
     r"become effective",
     r"shall commence",
     r"commence on",
-    r"commencing",           # catches "commencing on", "commencing the 1st day of", etc.
+    r"commencing on",
     r"entered into as of",
     r"made and entered into",
     r"dated as of",
@@ -214,17 +214,6 @@ def _line_tier(line, header_text):
     something other than the agreement, e.g. a specific deliverable)."""
     if any(re.search(p, header_text, re.IGNORECASE) for p in HEADER_EFFECTIVE_DATE_PATTERNS):
         return 2
-    # "effective date" as a phrase is specific enough that its presence on a
-    # line reliably signals the clause itself -- e.g. the preamble caption
-    # "TITLE AGREEMENT dated as of [date] (the Effective Date)" or a
-    # definitions line '"EFFECTIVE DATE" - January 21, 2002'. Unlike "dated
-    # as of" or "shall commence", which show up for unrelated obligations,
-    # "effective date" almost exclusively labels the agreement's own start.
-    # Skip the _matches_agreement co-occurrence requirement when it's present.
-    if re.search(r'\beffective\s+date\b', line, re.IGNORECASE) and any(
-        re.search(p, line, re.IGNORECASE) for p in STRONG_EFFECTIVE_DATE_PATTERNS
-    ):
-        return 1
     if _matches_agreement(line) and any(
         re.search(p, line, re.IGNORECASE) for p in STRONG_EFFECTIVE_DATE_PATTERNS
     ):

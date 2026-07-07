@@ -9,8 +9,8 @@ Setup:
     export ANTHROPIC_API_KEY="sk-ant-..."
 
 Run:
-    python3 phase1_governing_law.py "/path/to/CUADv1.json"
-    python3 phase1_governing_law.py "/path/to/CUADv1.json" --n 30
+    python3 versions/phase2.2_governing_law.py "/path/to/CUADv1.json"
+    python3 versions/phase2.2_governing_law.py "/path/to/CUADv1.json" --n 30
 """
 
 import sys
