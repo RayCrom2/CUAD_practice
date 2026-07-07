@@ -1,5 +1,5 @@
 """
-Phase 3.1 thin slice: extract the Effective Date from CUAD contracts using
+Phase 3.4 thin slice: extract the Effective Date from CUAD contracts using
 Claude, then score against the gold labels.
 
 This is the second clause type after Governing Law (Phase 1-2). Reuses the
@@ -15,8 +15,8 @@ Setup:
     export ANTHROPIC_API_KEY="sk-ant-..."
 
 Run:
-    python3 phase3.1_effective_date.py "/path/to/CUADv1.json" --n 30
-    python3 phase3.1_effective_date.py "/path/to/CUADv1.json" --absent --n 20
+    python3 versions/phase3.4_effective_date.py "/path/to/CUADv1.json" --n 30
+    python3 versions/phase3.4_effective_date.py "/path/to/CUADv1.json" --absent --n 20
 """
 
 import sys
@@ -46,7 +46,7 @@ STRONG_EFFECTIVE_DATE_PATTERNS = [
     r"become effective",
     r"shall commence",
     r"commence on",
-    r"commencing on",
+    r"commencing",           # catches "commencing on", "commencing the 1st day of", etc.
     r"entered into as of",
     r"made and entered into",
     r"dated as of",
@@ -119,6 +119,15 @@ SECTION_HEADER_PATTERNS = [
     re.compile(r"^\s*[A-Z0-9][A-Z0-9\s,&()'\-/]{8,}$"),
 ]
 
+# A tier-2 section whose header names the clause (e.g. "EFFECTIVE DATE") but
+# whose body is smaller than this threshold is almost certainly a table-of-
+# contents line, not an actual clause section. Downgrade to tier-0 so it
+# only surfaces as a last-resort fallback rather than crowding out real content.
+_MIN_TIER2_SECTION_CHARS = 400
+
+# TOC entries often end with a bare page number: "3. EFFECTIVE DATE     5"
+_TOC_PAGE_RE = re.compile(r'\s+\d{1,3}\s*$')
+
 
 def _tokenize(text):
     """Lowercase, split on whitespace, and strip surrounding punctuation off
@@ -172,11 +181,24 @@ def is_section_header(line):
     return False
 
 
-def build_section_spans(context):
-    """Return (start, end, header_text) spans for likely document sections."""
+def _scan_sections_and_keywords(context):
+    """Build section spans AND find effective-date keyword matches in one pass.
+
+    Previously two separate passes: build_section_spans() walked all lines to
+    find headers, then build_candidate_snippets() walked all lines again to
+    find keyword matches and compute tiers. This does both simultaneously by
+    tracking the current open section as we go.
+
+    Returns:
+        section_spans    : list of (start, end, header_text)
+        section_best_tier: dict of section_idx -> best tier seen for any line in it
+        section_order    : list of section indices in order of first keyword match
+        has_sections     : False when no header lines were found -- caller should
+                           use the keyword-windowing path instead
+    """
     lines = context.splitlines()
     if not lines:
-        return [(0, len(context), "")]
+        return [], {}, [], False
 
     line_starts = []
     cursor = 0
@@ -184,26 +206,43 @@ def build_section_spans(context):
         line_starts.append(cursor)
         cursor += len(line) + 1
 
-    header_indices = [i for i, line in enumerate(lines) if is_section_header(line)]
-    if not header_indices:
-        return [(0, len(context), "")]
+    section_spans = []
+    section_best_tier = {}
+    section_order = []
+    has_sections = False
 
-    spans = []
-    # Any text before the first detected header (the title block, exhibit
-    # number, opening preamble) would otherwise be silently dropped from
-    # every span -- for Effective Date specifically, that's exactly where
-    # the clause usually lives (median position is ~1% into the document).
-    if line_starts[header_indices[0]] > 0:
-        spans.append((0, line_starts[header_indices[0]], ""))
+    current_start = 0
+    current_header = ""
 
-    for idx, header_idx in enumerate(header_indices):
-        start = line_starts[header_idx]
-        end = len(context)
-        if idx + 1 < len(header_indices):
-            end = line_starts[header_indices[idx + 1]]
-        spans.append((start, end, lines[header_idx]))
+    for i, line in enumerate(lines):
+        line_start = line_starts[i]
 
-    return spans
+        if is_section_header(line):
+            # Close the current open section if it has content, then open a new one.
+            # Pre-header preamble (current_header="") is preserved as section 0
+            # when the first header doesn't start at offset 0 -- this fixes the
+            # preamble-orphaning bug where the opening paragraph was silently dropped.
+            if line_start > current_start:
+                section_spans.append((current_start, line_start, current_header))
+            current_start = line_start
+            current_header = line
+            has_sections = True
+
+        # Check for effective-date keyword match on this line.
+        if any(re.search(p, line, re.IGNORECASE) for p in EFFECTIVE_DATE_PATTERNS):
+            if re.search("|".join(NON_CLAUSE_HEADER_PATTERNS), current_header, re.IGNORECASE):
+                continue  # table of contents / index entries are never real clause text
+            # The current section is still open, so its future index is len(section_spans).
+            sidx = len(section_spans)
+            tier = _line_tier(line, current_header)
+            if sidx not in section_best_tier:
+                section_order.append(sidx)
+            section_best_tier[sidx] = max(tier, section_best_tier.get(sidx, -1))
+
+    # Close the last open section.
+    section_spans.append((current_start, len(context), current_header))
+
+    return section_spans, section_best_tier, section_order, has_sections
 
 
 def _line_tier(line, header_text):
@@ -214,6 +253,17 @@ def _line_tier(line, header_text):
     something other than the agreement, e.g. a specific deliverable)."""
     if any(re.search(p, header_text, re.IGNORECASE) for p in HEADER_EFFECTIVE_DATE_PATTERNS):
         return 2
+    # "effective date" as a phrase is specific enough that its presence on a
+    # line reliably signals the clause itself -- e.g. the preamble caption
+    # "TITLE AGREEMENT dated as of [date] (the Effective Date)" or a
+    # definitions line '"EFFECTIVE DATE" - January 21, 2002'. Unlike "dated
+    # as of" or "shall commence", which show up for unrelated obligations,
+    # "effective date" almost exclusively labels the agreement's own start.
+    # Skip the _matches_agreement co-occurrence requirement when it's present.
+    if re.search(r'\beffective\s+date\b', line, re.IGNORECASE) and any(
+        re.search(p, line, re.IGNORECASE) for p in STRONG_EFFECTIVE_DATE_PATTERNS
+    ):
+        return 1
     if _matches_agreement(line) and any(
         re.search(p, line, re.IGNORECASE) for p in STRONG_EFFECTIVE_DATE_PATTERNS
     ):
@@ -278,47 +328,29 @@ def build_candidate_snippets(context, max_sections=3, window_words=100):
     if not context:
         return [""], False
 
-    section_spans = build_section_spans(context)
+    section_spans, section_best_tier, section_order, has_sections = (
+        _scan_sections_and_keywords(context)
+    )
 
-    if len(section_spans) <= 1:
-        # No real internal structure was found (0 or 1 header line in the
-        # whole document). Window around matches instead of sending
-        # everything.
+    if not has_sections:
         return _build_keyword_window_snippets(context, window_words)
 
-    lines = context.splitlines()
-    if not lines:
-        return [context[:900].strip()], False
-
-    line_starts = []
-    cursor = 0
-    for line in lines:
-        line_starts.append(cursor)
-        cursor += len(line) + 1
-
-    section_best_tier = {}  # section_idx -> best tier seen, document order of first match
-    section_order = []
-    for i, line in enumerate(lines):
-        if any(re.search(p, line, re.IGNORECASE) for p in EFFECTIVE_DATE_PATTERNS):
-            for section_idx, (start, end, header_text) in enumerate(section_spans):
-                if start <= line_starts[i] < end:
-                    if re.search("|".join(NON_CLAUSE_HEADER_PATTERNS), header_text, re.IGNORECASE):
-                        break  # table of contents / index entries are never real clause text
-                    tier = _line_tier(line, header_text)
-                    if section_idx not in section_best_tier:
-                        section_order.append(section_idx)
-                    section_best_tier[section_idx] = max(tier, section_best_tier.get(section_idx, -1))
-                    break
-
     if not section_best_tier:
-        # Fallback: return the full contract so the model has maximum context.
         return [context.strip()], False
 
-    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
-    weak = [idx for idx in section_order if section_best_tier[idx] == 0]
+    # Downgrade tier-2 sections that are table-of-contents entries. A tier-2
+    # section has a header that literally names the clause ("Effective Date"),
+    # but TOC lines share that same header text while containing no actual
+    # clause body. Two signals: body smaller than _MIN_TIER2_SECTION_CHARS,
+    # or a trailing page number in the header ("3. EFFECTIVE DATE     5").
+    for idx in list(section_best_tier.keys()):
+        if section_best_tier[idx] >= 2:
+            start, end, header = section_spans[idx]
+            if (end - start) < _MIN_TIER2_SECTION_CHARS or _TOC_PAGE_RE.search(header):
+                section_best_tier[idx] = 0
 
-    # Strong matches are kept in full (there's normally only one). Weak
-    # matches are only used as a fallback, capped, when nothing strong exists.
+    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
+    weak   = [idx for idx in section_order if section_best_tier[idx] == 0]
     chosen_indices = strong if strong else weak[:max_sections]
 
     kept = {}
@@ -405,43 +437,20 @@ def diagnose_section_candidates(context, gold, max_sections=3):
     Designed to answer: is the cap cutting off the right section, or is
     the right section simply not generating any keyword match at all?
     """
-    section_spans = build_section_spans(context)
+    section_spans, section_best_tier, section_order, has_sections = (
+        _scan_sections_and_keywords(context)
+    )
 
     # Windowing path -- no real section structure
-    if len(section_spans) <= 1:
+    if not has_sections:
         windows, _ = _build_keyword_window_snippets(context)
         gold_key = gold.strip()[:40] if gold else ""
-        results = []
-        for i, w in enumerate(windows):
-            results.append({
-                "path": "windowing",
-                "window_idx": i,
-                "chars": len(w),
-                "gold_present": bool(gold_key and gold_key in w),
-                "preview": w[:80],
-            })
+        results = [
+            {"path": "windowing", "window_idx": i, "chars": len(w),
+             "gold_present": bool(gold_key and gold_key in w), "preview": w[:80]}
+            for i, w in enumerate(windows)
+        ]
         return {"path": "windowing", "windows": results}
-
-    lines = context.splitlines()
-    line_starts = []
-    cursor = 0
-    for line in lines:
-        line_starts.append(cursor)
-        cursor += len(line) + 1
-
-    section_best_tier = {}
-    section_order = []
-    for i, line in enumerate(lines):
-        if any(re.search(p, line, re.IGNORECASE) for p in EFFECTIVE_DATE_PATTERNS):
-            for section_idx, (start, end, header_text) in enumerate(section_spans):
-                if start <= line_starts[i] < end:
-                    if re.search("|".join(NON_CLAUSE_HEADER_PATTERNS), header_text, re.IGNORECASE):
-                        break
-                    tier = _line_tier(line, header_text)
-                    if section_idx not in section_best_tier:
-                        section_order.append(section_idx)
-                    section_best_tier[section_idx] = max(tier, section_best_tier.get(section_idx, -1))
-                    break
 
     if not section_best_tier:
         return {"path": "sections", "no_matches": True, "candidates": []}

@@ -1,32 +1,22 @@
 """
-Phase 3.6 thin slice: extract the Effective Date from CUAD contracts using
+Phase 3.2 thin slice: extract the Effective Date from CUAD contracts using
 Claude, then score against the gold labels.
 
-Targets the misses that survived Phase 3.5 (contracts #6, 7, 10, 11, 24,
-25, 26, 40, 43, 44, 48 in the present-clause ordering). The 3.5 diagnostics
-showed these are NOT snippet-selection-ordering failures; the two dominant
-modes are:
-
-1. Gold-label style mismatch: CUAD's gold is an "effective upon signing"
-   style clause ("shall become effective when counterparts have been
-   signed...", "shall take effect as of the date when the representatives
-   sign...") while the model reports the preamble calendar date -- the gold
-   text was IN the selected snippets, so this is a prompt/interpretation
-   problem, not retrieval (#6, 10, 11, 24, 25, 26, 44).
-2. Caption/signature-block sections that dodge the TOC downgrade: #48's
-   junk section headed "EFFECTIVE AS OF (EFFECTIVE DATE)" is 684 chars --
-   above the 400-char downgrade threshold, no trailing page number -- so it
-   stays tier 2 and crowds out the real clause. Pattern-coverage gaps
-   (#40, 43) are related retrieval misses.
+This is the second clause type after Governing Law (Phase 1-2). Reuses the
+same section-ranking / keyword-windowing snippet-selection infrastructure
+and the same forced-tool-use extraction pattern from phase2.2 -- only the
+clause-specific patterns, prompt, and tool are new. Deliberately starts
+simple (plain token-overlap scoring, no jurisdiction-style fallback yet) so
+any fixes added later are justified by real observed failures, not assumed
+up front just because Governing Law needed them.
 
 Setup:
     pip3 install anthropic --user
     export ANTHROPIC_API_KEY="sk-ant-..."
 
 Run:
-    python3 phase3.6_effective_date.py "/path/to/CUADv1.json" --n 30
-    python3 phase3.6_effective_date.py "/path/to/CUADv1.json" --absent --n 20
-    python3 phase3.6_effective_date.py "/path/to/CUADv1.json" --indices 6 7 10 11 24 25 26 40 43 44 48 --diagnose
+    python3 versions/phase3.2_effective_date.py "/path/to/CUADv1.json" --n 30
+    python3 versions/phase3.2_effective_date.py "/path/to/CUADv1.json" --absent --n 20
 """
 
 import sys
@@ -129,15 +119,6 @@ SECTION_HEADER_PATTERNS = [
     re.compile(r"^\s*[A-Z0-9][A-Z0-9\s,&()'\-/]{8,}$"),
 ]
 
-# A tier-2 section whose header names the clause (e.g. "EFFECTIVE DATE") but
-# whose body is smaller than this threshold is almost certainly a table-of-
-# contents line, not an actual clause section. Downgrade to tier-0 so it
-# only surfaces as a last-resort fallback rather than crowding out real content.
-_MIN_TIER2_SECTION_CHARS = 400
-
-# TOC entries often end with a bare page number: "3. EFFECTIVE DATE     5"
-_TOC_PAGE_RE = re.compile(r'\s+\d{1,3}\s*$')
-
 
 def _tokenize(text):
     """Lowercase, split on whitespace, and strip surrounding punctuation off
@@ -191,24 +172,11 @@ def is_section_header(line):
     return False
 
 
-def _scan_sections_and_keywords(context):
-    """Build section spans AND find effective-date keyword matches in one pass.
-
-    Previously two separate passes: build_section_spans() walked all lines to
-    find headers, then build_candidate_snippets() walked all lines again to
-    find keyword matches and compute tiers. This does both simultaneously by
-    tracking the current open section as we go.
-
-    Returns:
-        section_spans    : list of (start, end, header_text)
-        section_best_tier: dict of section_idx -> best tier seen for any line in it
-        section_order    : list of section indices in order of first keyword match
-        has_sections     : False when no header lines were found -- caller should
-                           use the keyword-windowing path instead
-    """
+def build_section_spans(context):
+    """Return (start, end, header_text) spans for likely document sections."""
     lines = context.splitlines()
     if not lines:
-        return [], {}, [], False
+        return [(0, len(context), "")]
 
     line_starts = []
     cursor = 0
@@ -216,43 +184,26 @@ def _scan_sections_and_keywords(context):
         line_starts.append(cursor)
         cursor += len(line) + 1
 
-    section_spans = []
-    section_best_tier = {}
-    section_order = []
-    has_sections = False
+    header_indices = [i for i, line in enumerate(lines) if is_section_header(line)]
+    if not header_indices:
+        return [(0, len(context), "")]
 
-    current_start = 0
-    current_header = ""
+    spans = []
+    # Any text before the first detected header (the title block, exhibit
+    # number, opening preamble) would otherwise be silently dropped from
+    # every span -- for Effective Date specifically, that's exactly where
+    # the clause usually lives (median position is ~1% into the document).
+    if line_starts[header_indices[0]] > 0:
+        spans.append((0, line_starts[header_indices[0]], ""))
 
-    for i, line in enumerate(lines):
-        line_start = line_starts[i]
+    for idx, header_idx in enumerate(header_indices):
+        start = line_starts[header_idx]
+        end = len(context)
+        if idx + 1 < len(header_indices):
+            end = line_starts[header_indices[idx + 1]]
+        spans.append((start, end, lines[header_idx]))
 
-        if is_section_header(line):
-            # Close the current open section if it has content, then open a new one.
-            # Pre-header preamble (current_header="") is preserved as section 0
-            # when the first header doesn't start at offset 0 -- this fixes the
-            # preamble-orphaning bug where the opening paragraph was silently dropped.
-            if line_start > current_start:
-                section_spans.append((current_start, line_start, current_header))
-            current_start = line_start
-            current_header = line
-            has_sections = True
-
-        # Check for effective-date keyword match on this line.
-        if any(re.search(p, line, re.IGNORECASE) for p in EFFECTIVE_DATE_PATTERNS):
-            if re.search("|".join(NON_CLAUSE_HEADER_PATTERNS), current_header, re.IGNORECASE):
-                continue  # table of contents / index entries are never real clause text
-            # The current section is still open, so its future index is len(section_spans).
-            sidx = len(section_spans)
-            tier = _line_tier(line, current_header)
-            if sidx not in section_best_tier:
-                section_order.append(sidx)
-            section_best_tier[sidx] = max(tier, section_best_tier.get(sidx, -1))
-
-    # Close the last open section.
-    section_spans.append((current_start, len(context), current_header))
-
-    return section_spans, section_best_tier, section_order, has_sections
+    return spans
 
 
 def _line_tier(line, header_text):
@@ -322,48 +273,6 @@ def _build_keyword_window_snippets(context, window_words=100):
     return snippets, True
 
 
-def _rank_candidate_sections(section_spans, section_best_tier, section_order,
-                             max_sections):
-    """Apply the TOC downgrade and produce the final selection order.
-
-    Shared by build_candidate_snippets and diagnose_section_candidates so the
-    diagnostic view can never drift from what actually gets selected.
-
-    Downgrade tier-2 sections that are table-of-contents entries. A tier-2
-    section has a header that literally names the clause ("Effective Date"),
-    but TOC lines share that same header text while containing no actual
-    clause body. Two signals: body smaller than _MIN_TIER2_SECTION_CHARS,
-    or a trailing page number in the header ("3. EFFECTIVE DATE     5").
-    Downgraded indices sort last in the weak pool -- an organic tier-0
-    section (never had a strong header signal) is a better candidate than
-    one that was tier-2 but turned out to be a TOC entry.
-
-    Mutates section_best_tier in place (downgraded entries become 0).
-
-    Returns:
-        strong    : tier 1+ indices in first-match order
-        weak      : tier-0 indices, organic first, downgraded last
-        downgraded: set of indices demoted by the TOC downgrade
-        chosen    : the indices that will actually be sent to the model
-    """
-    downgraded = set()
-    for idx in list(section_best_tier.keys()):
-        if section_best_tier[idx] >= 2:
-            start, end, header = section_spans[idx]
-            if (end - start) < _MIN_TIER2_SECTION_CHARS or _TOC_PAGE_RE.search(header):
-                section_best_tier[idx] = 0
-                downgraded.add(idx)
-
-    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
-    weak   = [idx for idx in section_order if section_best_tier[idx] == 0]
-    # Organic tier-0 sections precede downgraded ones; document order preserved
-    # within each group so the most relevant keyword neighbourhood comes first.
-    weak = [idx for idx in weak if idx not in downgraded] + \
-           [idx for idx in weak if idx in downgraded]
-    chosen = strong if strong else weak[:max_sections]
-    return strong, weak, downgraded, chosen
-
-
 def build_candidate_snippets(context, max_sections=3, window_words=100):
     """Return whole section text around likely effective-date phrases.
 
@@ -380,19 +289,48 @@ def build_candidate_snippets(context, max_sections=3, window_words=100):
     if not context:
         return [""], False
 
-    section_spans, section_best_tier, section_order, has_sections = (
-        _scan_sections_and_keywords(context)
-    )
+    section_spans = build_section_spans(context)
 
-    if not has_sections:
+    if len(section_spans) <= 1:
+        # No real internal structure was found (0 or 1 header line in the
+        # whole document). Window around matches instead of sending
+        # everything.
         return _build_keyword_window_snippets(context, window_words)
 
+    lines = context.splitlines()
+    if not lines:
+        return [context[:900].strip()], False
+
+    line_starts = []
+    cursor = 0
+    for line in lines:
+        line_starts.append(cursor)
+        cursor += len(line) + 1
+
+    section_best_tier = {}  # section_idx -> best tier seen, document order of first match
+    section_order = []
+    for i, line in enumerate(lines):
+        if any(re.search(p, line, re.IGNORECASE) for p in EFFECTIVE_DATE_PATTERNS):
+            for section_idx, (start, end, header_text) in enumerate(section_spans):
+                if start <= line_starts[i] < end:
+                    if re.search("|".join(NON_CLAUSE_HEADER_PATTERNS), header_text, re.IGNORECASE):
+                        break  # table of contents / index entries are never real clause text
+                    tier = _line_tier(line, header_text)
+                    if section_idx not in section_best_tier:
+                        section_order.append(section_idx)
+                    section_best_tier[section_idx] = max(tier, section_best_tier.get(section_idx, -1))
+                    break
+
     if not section_best_tier:
+        # Fallback: return the full contract so the model has maximum context.
         return [context.strip()], False
 
-    _strong, _weak, _downgraded, chosen_indices = _rank_candidate_sections(
-        section_spans, section_best_tier, section_order, max_sections
-    )
+    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
+    weak = [idx for idx in section_order if section_best_tier[idx] == 0]
+
+    # Strong matches are kept in full (there's normally only one). Weak
+    # matches are only used as a fallback, capped, when nothing strong exists.
+    chosen_indices = strong if strong else weak[:max_sections]
 
     kept = {}
     for section_idx in chosen_indices:
@@ -478,28 +416,50 @@ def diagnose_section_candidates(context, gold, max_sections=3):
     Designed to answer: is the cap cutting off the right section, or is
     the right section simply not generating any keyword match at all?
     """
-    section_spans, section_best_tier, section_order, has_sections = (
-        _scan_sections_and_keywords(context)
-    )
+    section_spans = build_section_spans(context)
 
     # Windowing path -- no real section structure
-    if not has_sections:
+    if len(section_spans) <= 1:
         windows, _ = _build_keyword_window_snippets(context)
         gold_key = gold.strip()[:40] if gold else ""
-        results = [
-            {"path": "windowing", "window_idx": i, "chars": len(w),
-             "gold_present": bool(gold_key and gold_key in w), "preview": w[:80]}
-            for i, w in enumerate(windows)
-        ]
+        results = []
+        for i, w in enumerate(windows):
+            results.append({
+                "path": "windowing",
+                "window_idx": i,
+                "chars": len(w),
+                "gold_present": bool(gold_key and gold_key in w),
+                "preview": w[:80],
+            })
         return {"path": "windowing", "windows": results}
+
+    lines = context.splitlines()
+    line_starts = []
+    cursor = 0
+    for line in lines:
+        line_starts.append(cursor)
+        cursor += len(line) + 1
+
+    section_best_tier = {}
+    section_order = []
+    for i, line in enumerate(lines):
+        if any(re.search(p, line, re.IGNORECASE) for p in EFFECTIVE_DATE_PATTERNS):
+            for section_idx, (start, end, header_text) in enumerate(section_spans):
+                if start <= line_starts[i] < end:
+                    if re.search("|".join(NON_CLAUSE_HEADER_PATTERNS), header_text, re.IGNORECASE):
+                        break
+                    tier = _line_tier(line, header_text)
+                    if section_idx not in section_best_tier:
+                        section_order.append(section_idx)
+                    section_best_tier[section_idx] = max(tier, section_best_tier.get(section_idx, -1))
+                    break
 
     if not section_best_tier:
         return {"path": "sections", "no_matches": True, "candidates": []}
 
-    strong, weak, downgraded, chosen_indices = _rank_candidate_sections(
-        section_spans, section_best_tier, section_order, max_sections
-    )
-    chosen = set(chosen_indices)
+    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
+    weak = [idx for idx in section_order if section_best_tier[idx] == 0]
+    chosen = set(strong) if strong else set(weak[:max_sections])
 
     gold_key = gold.strip()[:40] if gold else ""
     candidates = []
@@ -509,13 +469,12 @@ def diagnose_section_candidates(context, gold, max_sections=3):
         candidates.append({
             "section_idx": idx,
             "tier": section_best_tier[idx],
-            "downgraded": idx in downgraded,
             "header": header[:60] or "(preamble)",
             "chars": len(snippet),
             "selected": idx in chosen,
             "gold_present": bool(gold_key and gold_key in snippet),
         })
-    candidates.sort(key=lambda c: (-c["tier"], c["downgraded"], c["section_idx"]))
+    candidates.sort(key=lambda c: (-c["tier"], c["section_idx"]))
 
     return {"path": "sections", "no_matches": False, "candidates": candidates,
             "strong_count": len(strong), "weak_count": len(weak)}
@@ -558,30 +517,13 @@ def extract_effective_date(client, context):
         for i, snippet in enumerate(snippets)
     )
 
-    prompt = f"""You are reviewing a commercial contract. Find the EFFECTIVE DATE: when
-    this Agreement itself becomes effective or its term begins.
-
-    Contracts state this in two different places, and the distinction matters:
-
-    1. A dedicated effectiveness or commencement statement -- a clause or definition
-       that says when the agreement takes effect. This is often NOT a calendar date;
-       it can be contingent on an event, e.g. "This Agreement shall become effective
-       when one or more counterparts have been signed by each Party", "shall take
-       effect as of the date when the authorized representatives of the Parties sign",
-       "shall become effective upon the Closing", "effective 30 days after <event>",
-       "The term of this Agreement will begin on...", or a definition such as
-       '"Effective Date" shall have the meaning set forth in the preamble' or
-       '"Commencement Date" means the date of this Agreement'. A clause like this IS
-       the effective-date answer even when it contains no calendar date at all.
-
-    2. The preamble/caption date -- "This Agreement is made and entered into as of
-       January 1, 2020", "dated as of the 1st day of March, 2020".
-
-    If the text contains a dedicated effectiveness/commencement statement (category 1),
-    report THAT clause verbatim -- NOT the preamble date, even if the preamble date
-    looks cleaner or more specific. Report the preamble language only when no dedicated
-    statement exists; in many simple contracts the preamble is the only statement of
-    effectiveness, and in that case it is the correct answer.
+    prompt = f"""You are reviewing a commercial contract. Find the EFFECTIVE DATE: the date
+    this Agreement itself becomes effective or its term begins (e.g. "This Agreement is
+    effective as of January 1, 2020", "made and entered into as of the 1st day of March,
+    2020", or a date stated in the opening paragraph as when the parties enter into the
+    agreement). In most contracts there is only one such date, and it is both when the
+    document was signed and when it takes effect -- in that common case, that one date is
+    the correct answer.
 
     Some contracts explicitly separate two dates: an "Execution Date" (or "Agreement Date")
     -- when the document was physically signed -- from a distinctly-labeled "Effective
@@ -589,15 +531,15 @@ def extract_effective_date(client, context):
     that distinction, report the EFFECTIVE DATE / commencement date, NOT the execution or
     signing date.
 
-    If you are convinced that the language used in a particular contract is
-    likely to be the effective date, but there is information that seems redacted,
-    return that if no other date is present. For example, if the contract says
+    If you are convinved that the language used in a particular contract is 
+    likely to be the effective date, but there is information that seems redacted, 
+    return that if no other date is present. For example, if the contract says 
     "This Agreement is made and entered into as of [*****]", return the entire clause_text as the declaration of the effective date.
 
     Do NOT confuse this with other dates that may appear in the contract for unrelated
     purposes -- a termination/expiration date, a specific deliverable's due date, a renewal
-    date, or the date of a later amendment. Only the statement of when this Agreement
-    itself becomes effective or commences.
+    date, or the date of a later amendment. Only the date this Agreement itself becomes
+    effective or commences.
 
     The input may be either a portion of or the full contract. Use whatever
     context is provided, and do not assume that missing sections are available elsewhere.
@@ -727,8 +669,6 @@ def main():
                     sel = "SELECTED" if c["selected"] else "dropped  "
                     gold_tag = " <-- GOLD HERE" if c["gold_present"] else ""
                     tier_label = {2: "tier2(header)", 1: "tier1(strong)", 0: "tier0(weak)"}[c["tier"]]
-                    if c["downgraded"]:
-                        tier_label = "tier0(toc-downgraded)"
                     print(f"          [{sel}] {tier_label} | {c['chars']:6} chars | {c['header']!r}{gold_tag}")
 
         if args.show_usage:

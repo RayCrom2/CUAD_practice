@@ -1,5 +1,5 @@
 """
-Phase 3.3 thin slice: extract the Effective Date from CUAD contracts using
+Phase 3.5 thin slice: extract the Effective Date from CUAD contracts using
 Claude, then score against the gold labels.
 
 This is the second clause type after Governing Law (Phase 1-2). Reuses the
@@ -15,8 +15,8 @@ Setup:
     export ANTHROPIC_API_KEY="sk-ant-..."
 
 Run:
-    python3 phase3.3_effective_date.py "/path/to/CUADv1.json" --n 30
-    python3 phase3.3_effective_date.py "/path/to/CUADv1.json" --absent --n 20
+    python3 versions/phase3.5_effective_date.py "/path/to/CUADv1.json" --n 30
+    python3 versions/phase3.5_effective_date.py "/path/to/CUADv1.json" --absent --n 20
 """
 
 import sys
@@ -118,6 +118,15 @@ SECTION_HEADER_PATTERNS = [
     re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+[A-Z0-9][A-Z0-9\s,&()'\-/]{2,}$"),
     re.compile(r"^\s*[A-Z0-9][A-Z0-9\s,&()'\-/]{8,}$"),
 ]
+
+# A tier-2 section whose header names the clause (e.g. "EFFECTIVE DATE") but
+# whose body is smaller than this threshold is almost certainly a table-of-
+# contents line, not an actual clause section. Downgrade to tier-0 so it
+# only surfaces as a last-resort fallback rather than crowding out real content.
+_MIN_TIER2_SECTION_CHARS = 400
+
+# TOC entries often end with a bare page number: "3. EFFECTIVE DATE     5"
+_TOC_PAGE_RE = re.compile(r'\s+\d{1,3}\s*$')
 
 
 def _tokenize(text):
@@ -303,6 +312,48 @@ def _build_keyword_window_snippets(context, window_words=100):
     return snippets, True
 
 
+def _rank_candidate_sections(section_spans, section_best_tier, section_order,
+                             max_sections):
+    """Apply the TOC downgrade and produce the final selection order.
+
+    Shared by build_candidate_snippets and diagnose_section_candidates so the
+    diagnostic view can never drift from what actually gets selected.
+
+    Downgrade tier-2 sections that are table-of-contents entries. A tier-2
+    section has a header that literally names the clause ("Effective Date"),
+    but TOC lines share that same header text while containing no actual
+    clause body. Two signals: body smaller than _MIN_TIER2_SECTION_CHARS,
+    or a trailing page number in the header ("3. EFFECTIVE DATE     5").
+    Downgraded indices sort last in the weak pool -- an organic tier-0
+    section (never had a strong header signal) is a better candidate than
+    one that was tier-2 but turned out to be a TOC entry.
+
+    Mutates section_best_tier in place (downgraded entries become 0).
+
+    Returns:
+        strong    : tier 1+ indices in first-match order
+        weak      : tier-0 indices, organic first, downgraded last
+        downgraded: set of indices demoted by the TOC downgrade
+        chosen    : the indices that will actually be sent to the model
+    """
+    downgraded = set()
+    for idx in list(section_best_tier.keys()):
+        if section_best_tier[idx] >= 2:
+            start, end, header = section_spans[idx]
+            if (end - start) < _MIN_TIER2_SECTION_CHARS or _TOC_PAGE_RE.search(header):
+                section_best_tier[idx] = 0
+                downgraded.add(idx)
+
+    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
+    weak   = [idx for idx in section_order if section_best_tier[idx] == 0]
+    # Organic tier-0 sections precede downgraded ones; document order preserved
+    # within each group so the most relevant keyword neighbourhood comes first.
+    weak = [idx for idx in weak if idx not in downgraded] + \
+           [idx for idx in weak if idx in downgraded]
+    chosen = strong if strong else weak[:max_sections]
+    return strong, weak, downgraded, chosen
+
+
 def build_candidate_snippets(context, max_sections=3, window_words=100):
     """Return whole section text around likely effective-date phrases.
 
@@ -329,9 +380,9 @@ def build_candidate_snippets(context, max_sections=3, window_words=100):
     if not section_best_tier:
         return [context.strip()], False
 
-    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
-    weak   = [idx for idx in section_order if section_best_tier[idx] == 0]
-    chosen_indices = strong if strong else weak[:max_sections]
+    _strong, _weak, _downgraded, chosen_indices = _rank_candidate_sections(
+        section_spans, section_best_tier, section_order, max_sections
+    )
 
     kept = {}
     for section_idx in chosen_indices:
@@ -435,9 +486,10 @@ def diagnose_section_candidates(context, gold, max_sections=3):
     if not section_best_tier:
         return {"path": "sections", "no_matches": True, "candidates": []}
 
-    strong = [idx for idx in section_order if section_best_tier[idx] >= 1]
-    weak = [idx for idx in section_order if section_best_tier[idx] == 0]
-    chosen = set(strong) if strong else set(weak[:max_sections])
+    strong, weak, downgraded, chosen_indices = _rank_candidate_sections(
+        section_spans, section_best_tier, section_order, max_sections
+    )
+    chosen = set(chosen_indices)
 
     gold_key = gold.strip()[:40] if gold else ""
     candidates = []
@@ -447,12 +499,13 @@ def diagnose_section_candidates(context, gold, max_sections=3):
         candidates.append({
             "section_idx": idx,
             "tier": section_best_tier[idx],
+            "downgraded": idx in downgraded,
             "header": header[:60] or "(preamble)",
             "chars": len(snippet),
             "selected": idx in chosen,
             "gold_present": bool(gold_key and gold_key in snippet),
         })
-    candidates.sort(key=lambda c: (-c["tier"], c["section_idx"]))
+    candidates.sort(key=lambda c: (-c["tier"], c["downgraded"], c["section_idx"]))
 
     return {"path": "sections", "no_matches": False, "candidates": candidates,
             "strong_count": len(strong), "weak_count": len(weak)}
@@ -647,6 +700,8 @@ def main():
                     sel = "SELECTED" if c["selected"] else "dropped  "
                     gold_tag = " <-- GOLD HERE" if c["gold_present"] else ""
                     tier_label = {2: "tier2(header)", 1: "tier1(strong)", 0: "tier0(weak)"}[c["tier"]]
+                    if c["downgraded"]:
+                        tier_label = "tier0(toc-downgraded)"
                     print(f"          [{sel}] {tier_label} | {c['chars']:6} chars | {c['header']!r}{gold_tag}")
 
         if args.show_usage:

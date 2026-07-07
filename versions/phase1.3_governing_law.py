@@ -9,8 +9,8 @@ Setup:
     export ANTHROPIC_API_KEY="sk-ant-..."
 
 Run:
-    python3 phase1_governing_law.py "/path/to/CUADv1.json"
-    python3 phase1_governing_law.py "/path/to/CUADv1.json" --n 30
+    python3 versions/phase1.3_governing_law.py "/path/to/CUADv1.json"
+    python3 versions/phase1.3_governing_law.py "/path/to/CUADv1.json" --n 30
 """
 
 import sys
@@ -66,7 +66,7 @@ STRONG_GOVERNING_LAW_PATTERNS = [
 ]
 WEAK_GOVERNING_LAW_PATTERNS = [
     r"jurisdiction",
-    r"\bvenue\b",  # word boundary -- bare "venue" without it matches inside "Avenue", "revenue"
+    r"venue",
 ]
 GOVERNING_LAW_PATTERNS = STRONG_GOVERNING_LAW_PATTERNS + WEAK_GOVERNING_LAW_PATTERNS
 
@@ -329,34 +329,12 @@ def build_candidate_snippets(context, max_sections=3, window_words=100):
     return (snippets or [context.strip()]), True
 
 
-def _find_governing_law_qa(contract):
-    """Return (context, gold_or_None) for the first Governing Law question
-    found in this contract, or None if the contract has no such question at
-    all. gold_or_None is the answer text if CUAD labels one, or None if the
-    question exists but the answers list is empty (clause genuinely absent).
-    """
-    for para in contract["paragraphs"]:
-        for qa in para["qas"]:
-            if GOVERNING_LAW in qa["question"]:
-                gold = qa["answers"][0]["text"] if qa["answers"] else None
-                return para["context"], gold
-    return None
+def load_governing_law_examples(json_path, n=None, indices=None):
+    """Return (position, title, context, gold_text) tuples that HAVE a GL clause.
 
-
-def load_governing_law_examples(json_path, n=None, indices=None, require_present=True):
-    """Return (position, title, context, gold_text) tuples.
-
-    By default (require_present=True) only contracts that HAVE a Governing
-    Law clause are returned -- gold_text is the labeled clause. With
-    require_present=False, returns contracts where the clause is genuinely
-    ABSENT (CUAD's answers list is empty) -- gold_text is "" for every
-    example. That set exists to measure hallucination rate: does the model
-    invent a clause when none is actually present?
-
-    `position` is the 1-based index into the matching ordered list (present
-    or absent, whichever was requested) -- the same numbering shown in a
-    run's "(contract #i)" output, so you can re-run specific contracts later
-    with --indices.
+    `position` is the 1-based index into the full ordered list of GL-bearing
+    contracts -- the same numbering shown in a run's "(contract #i)" output,
+    so you can re-run specific contracts later with --indices.
 
     If `indices` is given, return exactly those positions (skipping any out
     of range, with a warning), in the order requested. Otherwise return the
@@ -367,13 +345,12 @@ def load_governing_law_examples(json_path, n=None, indices=None, require_present
 
     examples = []
     for contract in cuad["data"]:
-        found = _find_governing_law_qa(contract)
-        if found is None:
-            continue
-        context, gold = found
-        if (gold is not None) != require_present:
-            continue
-        examples.append((contract["title"], context, gold or ""))
+        for para in contract["paragraphs"]:
+            for qa in para["qas"]:
+                if GOVERNING_LAW in qa["question"] and qa["answers"]:
+                    gold = qa["answers"][0]["text"]
+                    examples.append((contract["title"], para["context"], gold))
+                    break  # one GL question per contract
         # Without --indices we can stop early once we have n; with --indices
         # we don't know which positions are needed until the full list exists.
         if indices is None and n is not None and len(examples) >= n:
@@ -386,9 +363,8 @@ def load_governing_law_examples(json_path, n=None, indices=None, require_present
                 title, context, gold = examples[pos - 1]
                 selected.append((pos, title, context, gold))
             else:
-                clause_state = "have a Governing Law clause" if require_present else "are missing a Governing Law clause"
                 print(f"WARNING: --indices {pos} is out of range "
-                      f"(only {len(examples)} contracts {clause_state}) -- skipping.")
+                      f"(only {len(examples)} contracts have a Governing Law clause) -- skipping.")
         return selected
 
     limited = examples[:n] if n is not None else examples
@@ -403,19 +379,31 @@ def extract_governing_law(client, context):
         for i, snippet in enumerate(snippets)
     )
 
+    if used_section_match:
+        scope_note = (
+            "You are being shown only a SHORT EXCERPT (or a few excerpts) selected from the "
+            "contract, not the full document. The governing law clause may or may not be "
+            "among what is shown -- judge only based on what actually appears below, and do "
+            "not assume the clause exists elsewhere just because you can't see the rest of "
+            "the contract."
+        )
+    else:
+        scope_note = (
+            "You are being shown the ENTIRE contract below, in full -- there is no "
+            "additional text beyond what is shown."
+        )
+
     prompt = f"""You are reviewing a commercial contract. Find the GOVERNING LAW clause:
     the sentence that states which state's or country's law governs the agreement.
 
-    The input may be either a single section excerpt or the full contract. Use whatever
-    context is provided, and do not assume that missing sections are available elsewhere.
+    {scope_note}
 
     Return ONLY the exact clause text, copied verbatim character-for-character from the
     contract. Do NOT paraphrase, summarize, or rephrase it in your own words, even if you
     are confident about the meaning -- copy the original sentence exactly as written.
-
-    If no governing law clause is present, respond with exactly the single word NONE and
-    nothing else: no explanation of what the excerpt does or doesn't contain, no apology,
-    no punctuation. Just the word NONE on its own.
+    Return nothing else: no JSON, no explanation, no commentary about what you found or
+    didn't find. If no governing law clause is present, return an empty response and
+    nothing more.
 
     Relevant excerpts from the contract:
     {snippet_block}"""
@@ -430,18 +418,7 @@ def extract_governing_law(client, context):
         "input_tokens": getattr(usage, "input_tokens", 0),
         "output_tokens": getattr(usage, "output_tokens", 0),
     }
-    if not resp.content:
-        # Claude occasionally ends the turn with zero content blocks (seen on
-        # contracts with no real governing-law signal at all) -- treat that
-        # the same as an explicit empty response rather than crashing.
-        print(f"        (empty response, stop_reason={resp.stop_reason!r})")
-        return "", usage_summary, used_section_match
-    text = resp.content[0].text.strip()
-    if text.upper() == "NONE":
-        # Normalize the not-found sentinel to empty so clause_overlap scores it
-        # the same way as a genuinely empty response.
-        text = ""
-    return text, usage_summary, used_section_match
+    return resp.content[0].text.strip(), usage_summary, used_section_match
 
 
 def main():
@@ -452,8 +429,6 @@ def main():
     selection.add_argument("--indices", type=int, nargs="+",
                             help="Test only these 1-based contract positions, e.g. --indices 22 23 39 "
                                  "(matches the \"(contract #i)\" numbering printed by a previous run)")
-    ap.add_argument("--absent", action="store_true",
-                     help="Test contracts with NO Governing Law clause instead, to measure hallucination rate")
     ap.add_argument("--show-usage", action="store_true", help="Print token usage per request")
     ap.add_argument("--input-price-per-1m", type=float, default=0.0, help="Optional input token price per 1M tokens")
     ap.add_argument("--output-price-per-1m", type=float, default=0.0, help="Optional output token price per 1M tokens")
@@ -463,16 +438,12 @@ def main():
         print("ERROR: set ANTHROPIC_API_KEY first:  export ANTHROPIC_API_KEY=...")
         sys.exit(1)
 
-    require_present = not args.absent
     client = Anthropic()
     if args.indices:
-        examples = load_governing_law_examples(args.json_path, indices=args.indices, require_present=require_present)
+        examples = load_governing_law_examples(args.json_path, indices=args.indices)
         print(f"Testing {len(examples)} specific contract(s): {args.indices}\n")
-    elif args.absent:
-        examples = load_governing_law_examples(args.json_path, n=args.n, require_present=False)
-        print(f"Testing {len(examples)} contracts with NO Governing Law clause (hallucination-rate check).\n")
     else:
-        examples = load_governing_law_examples(args.json_path, n=args.n, require_present=True)
+        examples = load_governing_law_examples(args.json_path, n=args.n)
         print(f"Testing {len(examples)} contracts that have a Governing Law clause.\n")
 
     correct = 0
@@ -533,13 +504,7 @@ def main():
     )
     avg_fallback_input_tokens = fallback_input_tokens / fallback_count if fallback_count else 0
     print("\n" + "=" * 50)
-    if args.absent:
-        hallucinations = len(examples) - correct
-        hall_rate = hallucinations / len(examples) if examples else 0
-        print(f"HALLUCINATION RATE: {hallucinations}/{len(examples)} = {hall_rate:.0%}")
-        print(f"CORRECTLY ABSTAINED: {correct}/{len(examples)} = {acc:.0%}")
-    else:
-        print(f"ACCURACY: {correct}/{len(examples)} = {acc:.0%}")
+    print(f"ACCURACY: {correct}/{len(examples)} = {acc:.0%}")
     print(f"SECTION MATCHES: {section_match_count}/{len(examples)}")
     print(f"FALLBACKS: {fallback_count}/{len(examples)}")
     print(f"TOKENS: input={total_input_tokens} output={total_output_tokens} total={total_input_tokens + total_output_tokens}")
